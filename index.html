@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Trip"><meta name="theme-color" content="#4cc9f0">
+<link rel="manifest" href="manifest.json"><link rel="apple-touch-icon" href="icon-180.png">
+<title>Trip</title>
+<style>
+:root{--bg:#4cc9f0;--ink:#1a1a1a;--soft:rgba(26,26,26,.6);--panel:rgba(26,26,26,.09)}
+*{box-sizing:border-box;margin:0}
+html,body{height:100%;background:var(--bg);color:var(--ink);font-family:-apple-system,"SF Pro Display","Helvetica Neue",Arial,sans-serif;-webkit-user-select:none;user-select:none;overscroll-behavior:none}
+body{display:flex;flex-direction:column;gap:14px;overflow-y:auto;padding:calc(env(safe-area-inset-top,0px) + 16px) 20px calc(env(safe-area-inset-bottom,0px) + 16px)}
+button{border:0;border-radius:14px;background:var(--ink);color:var(--bg);font-family:inherit;font-size:1.15rem;font-weight:700;padding:16px;width:100%}
+button:active{opacity:.8}
+button:focus-visible{outline:3px solid var(--ink);outline-offset:3px}
+.mini{width:auto;padding:8px 12px;font-size:.9rem;background:var(--panel);color:var(--ink);border-radius:10px}
+.st{color:var(--soft);font-size:.95rem;min-height:1.4em}
+.row{display:flex;justify-content:space-between;gap:10px;font-size:.9rem;color:var(--soft);font-variant-numeric:tabular-nums}
+.row b{display:block;font-size:1.45rem;color:var(--ink);font-weight:700}
+
+#map{width:100%;height:260px;border-radius:14px;background:var(--panel);flex:none}
+.trip{display:flex;justify-content:space-between;align-items:center;gap:8px;background:var(--panel);border-radius:12px;padding:10px 12px;font-size:.9rem;flex:none}
+.trip span{flex:1}
+.trip .mini{background:var(--ink);color:var(--bg)}
+#list{display:flex;flex-direction:column;gap:8px}
+
+</style></head><body>
+
+<div class="st" id="st">Press start to record a route.</div>
+<canvas id="map"></canvas>
+<div class="row"><div><b id="t-dist">0.00</b>km</div><div><b id="t-time">0:00</b>time</div><div><b id="t-avg">0.00</b>avg km/h</div><div><b id="t-max">0.00</b>max km/h</div></div>
+<button id="rec">Start recording</button>
+<div id="list"></div>
+<script>
+(() => {
+const $ = id => document.getElementById(id), fmt = v => v.toFixed(2), rad = d => d * Math.PI / 180, p2 = n => String(n).padStart(2, '0');
+let wake = null, want = false;
+async function acquire() { if (!want || wake) return; try { wake = await navigator.wakeLock.request('screen'); wake.onrelease = () => { wake = null; }; } catch (e) {} }
+function keepAwake(on) { want = on; if (on) acquire(); else if (wake) { wake.release().catch(() => {}); wake = null; } }
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') acquire(); });
+const hav = (a, b) => { const R = 6371000, dl = rad(b.la - a.la), dn = rad(b.lo - a.lo), h = Math.sin(dl/2)**2 + Math.cos(rad(a.la))*Math.cos(rad(b.la))*Math.sin(dn/2)**2; return 2*R*Math.asin(Math.sqrt(h)); };
+const GPSERR = { 1: 'Location is blocked. Allow it in Settings > Privacy > Location Services > Safari Websites.', 2: 'No GPS signal. Move to an open area.', 3: 'GPS is taking too long. Keep waiting.' };
+const store = { get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch (e) { return d; } }, set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} } };
+
+const st = m => $('st').textContent = m;
+const fmtTime = s => { s = Math.round(s); const h = Math.floor(s/3600), m = Math.floor(s%3600/60), x = s%60; return h ? `${h}:${p2(m)}:${p2(x)}` : `${m}:${p2(x)}`; };
+let trip = null, tick = null, watchId = null, picked = null, prev = null, saved = store.get('trips', []);
+const shownTrip = () => picked || trip || saved[0] || { pts: [] };
+function onPos(p) {
+  const c = p.coords, t = p.timestamp, cur = { la: c.latitude, lo: c.longitude };
+  if (c.accuracy > 30) { st('Weak GPS signal (± ' + Math.round(c.accuracy) + ' m). Waiting…'); return; }
+  let ms = c.speed;
+  if (ms == null || isNaN(ms)) { ms = 0; if (prev && t > prev.t) ms = hav(prev, cur) / ((t - prev.t) / 1000); }
+  prev = { ...cur, t };
+  let v = Math.max(0, ms * 3.6); if (v < .3) v = 0;
+  const pr = trip.pts[trip.pts.length - 1];
+  if (pr) { const d = hav({ la: pr[0], lo: pr[1] }, cur); if (d < 3) return; trip.dist += d; }
+  trip.pts.push([cur.la, cur.lo, t, +v.toFixed(2)]); trip.max = Math.max(trip.max, v);
+  st('Recording'); drawRoute(trip); updTrip();
+}
+function updTrip() {
+  const tr = shownTrip(); if (!tr.start) return;
+  const el = ((tr.end || Date.now()) - tr.start) / 1000, km = tr.dist / 1000;
+  $('t-dist').textContent = fmt(km); $('t-time').textContent = fmtTime(el);
+  $('t-avg').textContent = fmt(el > 0 ? km / (el / 3600) : 0); $('t-max').textContent = fmt(tr.max);
+}
+function drawRoute(tr) {
+  const cv = $('map'), dpr = devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight; if (!w) return;
+  cv.width = w * dpr; cv.height = h * dpr; const x = cv.getContext('2d'); x.scale(dpr, dpr);
+  const P = tr.pts; if (P.length < 2) return;
+  const k = Math.cos(rad(P.reduce((s, p) => s + p[0], 0) / P.length));
+  const xs = P.map(p => p[1] * k), ys = P.map(p => p[0]);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys), pad = 24;
+  const s = Math.min((w - 2*pad) / ((x1 - x0) || 1e-9), (h - 2*pad) / ((y1 - y0) || 1e-9));
+  const ox = (w - (x1 - x0) * s) / 2, oy = (h - (y1 - y0) * s) / 2;
+  const pt = i => [ox + (xs[i] - x0) * s, h - (oy + (ys[i] - y0) * s)];
+  x.lineWidth = 4; x.lineJoin = x.lineCap = 'round'; x.strokeStyle = '#1a1a1a'; x.beginPath();
+  P.forEach((_, i) => { const [a, b] = pt(i); i ? x.lineTo(a, b) : x.moveTo(a, b); }); x.stroke();
+  const [sa, sb] = pt(0), [ea, eb] = pt(P.length - 1);
+  x.fillStyle = '#fff'; x.lineWidth = 3; x.beginPath(); x.arc(sa, sb, 7, 0, 7); x.fill(); x.stroke();
+  x.fillStyle = '#1a1a1a'; x.beginPath(); x.arc(ea, eb, 7, 0, 7); x.fill();
+}
+function start() {
+  if (!navigator.geolocation) { st('This device has no location support.'); return; }
+  picked = null; prev = null; trip = { start: Date.now(), pts: [], dist: 0, max: 0, end: 0 };
+  watchId = navigator.geolocation.watchPosition(onPos, e => st(GPSERR[e.code] || 'Location error.'), { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
+  tick = setInterval(updTrip, 1000); keepAwake(true); $('rec').textContent = 'Stop and save'; st('Looking for GPS signal…'); drawRoute(trip); updTrip();
+}
+function stop() {
+  navigator.geolocation.clearWatch(watchId); watchId = null; clearInterval(tick); keepAwake(false);
+  trip.end = Date.now(); $('rec').textContent = 'Start recording';
+  if (trip.pts.length > 1) { saved.unshift(trip); saved = saved.slice(0, 30); store.set('trips', saved); renderList(); st('Trip saved.'); }
+  else st('Trip too short to save.');
+  updTrip();
+}
+$('rec').onclick = () => watchId === null ? start() : stop();
+function renderList() {
+  $('list').innerHTML = saved.map((t, i) => `<div class="trip"><span>${new Date(t.start).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}<br>${fmt(t.dist/1000)} km, ${fmtTime((t.end - t.start)/1000)}</span><button class="mini" data-a="view" data-i="${i}">Map</button><button class="mini" data-a="gpx" data-i="${i}">GPX</button><button class="mini" data-a="del" data-i="${i}">Delete</button></div>`).join('');
+}
+$('list').onclick = async e => {
+  const b = e.target.closest('button'); if (!b) return; const i = +b.dataset.i, t = saved[i];
+  if (b.dataset.a === 'view') { picked = t; drawRoute(t); updTrip(); window.scrollTo(0, 0); document.body.scrollTop = 0; }
+  if (b.dataset.a === 'del') { if (picked === t) picked = null; saved.splice(i, 1); store.set('trips', saved); renderList(); drawRoute(shownTrip()); }
+  if (b.dataset.a === 'gpx') {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?><gpx version="1.1" creator="Trip" xmlns="http://www.topografix.com/GPX/1/1"><trk><name>${new Date(t.start).toISOString()}</name><trkseg>${t.pts.map(p => `<trkpt lat="${p[0]}" lon="${p[1]}"><time>${new Date(p[2]).toISOString()}</time></trkpt>`).join('')}</trkseg></trk></gpx>`;
+    const f = new File([xml], 'trip-' + new Date(t.start).toISOString().slice(0, 16).replace(/[:T]/g, '-') + '.gpx', { type: 'application/gpx+xml' });
+    if (navigator.canShare && navigator.canShare({ files: [f] })) { try { await navigator.share({ files: [f] }); return; } catch (err) { if (err.name === 'AbortError') return; } }
+    const a = document.createElement('a'); a.href = URL.createObjectURL(f); a.download = f.name; a.click();
+  }
+};
+renderList(); requestAnimationFrame(() => { drawRoute(shownTrip()); updTrip(); });
+addEventListener('resize', () => drawRoute(shownTrip()));
+
+})();
+</script></body></html>
